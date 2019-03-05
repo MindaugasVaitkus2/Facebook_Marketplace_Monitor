@@ -8,6 +8,7 @@ import time
 import requests
 import json
 import pickle
+import pyquery
 import email
 import smtplib
 from email.mime.text import MIMEText
@@ -15,21 +16,50 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
 config = {
-    'url': 'https://www.facebook.com/api/graphql/',
-    'c_user': '',
-    'xs': '',
-    'fb_dtsg': '',
-    'user_agent': 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.109 Safari/537.36',
     'search_terms': ['hifi','audi a6'],
     'filter_location_id': '',
-    'state_file': 'items.pickle',
-    'email_server': '',
+    'filter_radius_km': '20',
+    'fb_email': '',
+    'fb_pass': '',
+    'email_server': 'smtp.mailgun.org',
     'email_user': '',
     'email_from': '',
     'email_pass': '',
-    'email_dest': ''
+    'email_dest': '',
+    'user_agent': 'Mozilla/5.0 (Linux; Android 7.0; SM-G930V Build/NRD90M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/59.0.3071.125 Mobile Safari/537.36',
+    'url': 'https://www.facebook.com/api/graphql/',
+    'state_file': 'items.pickle',
+    'cookie_file': 'fbcookies.pickle'
 }
-Session=None
+
+def login():
+    try:
+        logging.debug('Attempting to load existing cookies')
+        with open(config['cookie_file'], 'rb') as f:
+            Session.cookies.update(pickle.load(f))
+            logging.debug("Cookies loaded")
+    except IOError:
+        logging.info("No existing cookie file found")
+    try:
+        logging.info('Logging in..')
+        do_post('https://m.facebook.com/login.php', data={
+            'email': config['fb_email'],
+            'pass': config['fb_pass']
+        })
+        logging.debug('c_user: %s' % Session.cookies['c_user'])
+        homepage = do_get('https://m.facebook.com/home.php')
+        dom = pyquery.PyQuery(homepage.text.encode('utf8'))
+        fb_dtsg = dom('input[name="fb_dtsg"]').val()
+        logging.debug('fb_dtsg: %s' % fb_dtsg)
+        logging.debug('Saving cookies')
+        with open(config['cookie_file'], 'wb') as f:
+            pickle.dump(Session.cookies, f)
+        logging.info('Login success')
+        return Session.cookies['c_user'], Session.cookies['xs'], fb_dtsg
+    except Exception as e:
+        logging.exception(e)
+        logging.error('Login failed')
+        sys.exit(1)
 
 def set_requests_session():
     s = requests.Session()
@@ -41,8 +71,6 @@ def set_requests_session():
     return s
 
 def do_get(url, stream=False, retries=3, retry_on=[500,501,502,503]):
-    global Session
-    if Session is None: Session = set_requests_session()
     res = None
     for r in range(retries):
         try:
@@ -59,30 +87,32 @@ def do_get(url, stream=False, retries=3, retry_on=[500,501,502,503]):
     return res
 
 def do_post(url, data, stream=False, retries=3, retry_on=[500,501,502,503]):
-    global Session
-    if Session is None: Session = set_requests_session()
     res = None
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    cookies = dict(c_user=config['c_user'],xs=config['xs'])
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': config['user_agent']
+    }
     for r in range(retries):
         try:
-            res = Session.post(url, stream=stream, timeout=30, data=data, cookies=cookies, headers=headers)
+            res = Session.post(url, stream=stream, timeout=30, data=data, headers=headers, allow_redirects=True)
         except (requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
             logging.error("Could not connect to %s after %s attempts" % (url, retries))
             logging.debug(e)
             sys.exit(1)
         if res.status_code == 200:
+            logging.debug("Response code: %s" % res.status_code)
             return res
         elif res.status_code in retry_on:
             print("%d/%d Retrying on %s http error..." % (r+1, retries, res.status_code))
             sleep(5)
     return res
 
-def search_fb_market(search_term,filter_location_id,known_items,new_items,fb_dtsg):
+def search_fb_market(search_term,filter_location_id,known_items,fb_dtsg,filter_radius_km):
     logging.info("Searching for: "+search_term)
     search_term = search_term.replace(' ','%20')
-    data = 'fb_dtsg='+fb_dtsg+'&variables=%7B%22MARKETPLACE_FEED_ITEM_IMAGE_WIDTH%22%3A246%2C%22VERTICALS_LEAD_GEN_PHOTO_HEIGHT_WIDTH%22%3A40%2C%22MERCHANT_LOGO_SCALE%22%3Anull%2C%22params%22%3A%7B%22bqf%22%3A%7B%22callsite%22%3A%22COMMERCE_MKTPLACE_WWW%22%2C%22query%22%3A%22'+search_term+'%22%7D%2C%22browse_request_params%22%3A%7B%22filter_location_id%22%3A%22'+filter_location_id+'%22%2C%22commerce_search_sort_by%22%3A%22CREATION_TIME_DESCEND%22%2C%22filter_price_lower_bound%22%3A0%2C%22filter_price_upper_bound%22%3A214748364700%7D%2C%22custom_request_params%22%3A%7B%22surface%22%3A%22SEARCH%22%2C%22search_vertical%22%3A%22C2C%22%7D%7D%7D&doc_id=1995581697207097'
+    data = 'fb_dtsg='+fb_dtsg+'&variables=%7B%22MARKETPLACE_FEED_ITEM_IMAGE_WIDTH%22%3A246%2C%22VERTICALS_LEAD_GEN_PHOTO_HEIGHT_WIDTH%22%3A40%2C%22MERCHANT_LOGO_SCALE%22%3Anull%2C%22params%22%3A%7B%22bqf%22%3A%7B%22callsite%22%3A%22COMMERCE_MKTPLACE_WWW%22%2C%22query%22%3A%22'+search_term+'%22%7D%2C%22browse_request_params%22%3A%7B%22filter_location_id%22%3A%22'+filter_location_id+'%22%2C%22commerce_search_sort_by%22%3A%22CREATION_TIME_DESCEND%22%2C%22filter_radius_km%22%3A%22'+filter_radius_km+'%22%2C%22filter_price_lower_bound%22%3A0%2C%22filter_price_upper_bound%22%3A214748364700%7D%2C%22custom_request_params%22%3A%7B%22surface%22%3A%22SEARCH%22%2C%22search_vertical%22%3A%22C2C%22%7D%7D%7D&doc_id=1995581697207097'
     result = do_post(config['url'], data)
+    new_items = []
     try:
         result_json = json.loads(result.text)
     except:
@@ -157,9 +187,10 @@ def save_known_items(known_items):
         sys.exit(1)
 
 # Main
+Session = set_requests_session()
 def main():
     global args
-    parser = argparse.ArgumentParser(description='Automate MS rewards')
+    parser = argparse.ArgumentParser(description='Search FB Marketplace for keywords')
     parser.add_argument('-l', '--log_level', default='info', help='log level')
     args = parser.parse_args()
     LogLevels = {'info': logging.INFO, 'error': logging.ERROR, 'debug': logging.DEBUG, 'critical': logging.CRITICAL}
@@ -168,10 +199,11 @@ def main():
         format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
         datefmt='%d/%m/%Y %H:%M:%S')
 
+    config['c_user'], config['xs'], config['fb_dtsg'] = login()
     known_items = load_known_items()
     new_items = []
     for search_term in config['search_terms']:
-        new_items += search_fb_market(search_term, config['filter_location_id'], known_items, new_items, config['fb_dtsg'])
+        new_items += search_fb_market(search_term, config['filter_location_id'], known_items, config['fb_dtsg'], config['filter_radius_km'])
     if len(new_items) > 0:
         notify(new_items)
     else:
